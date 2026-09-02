@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -63,6 +64,49 @@ class Snapshot:
     entry_high: float | None
     stop: float | None
     target: float | None
+
+
+@dataclass(frozen=True)
+class OpenPosition:
+    key: str
+    account_name: str
+    ticker: str
+    instrument_id: str
+    quantity: float
+    average_price: float
+
+    @property
+    def direction(self) -> str:
+        return "LONG" if self.quantity > 0 else "SHORT"
+
+
+@dataclass(frozen=True)
+class PositionPlan:
+    direction: str
+    entry: float
+    atr: float
+    stop: float
+    target: float
+    stage: str = "INITIAL"
+
+
+@dataclass(frozen=True)
+class PositionAdvice:
+    action: str
+    plan: PositionPlan
+    reason: str
+
+
+@dataclass(frozen=True)
+class EntryPlan:
+    ticker: str
+    direction: str
+    signal_time: str
+    detected_at: str
+    entry_low: float
+    entry_high: float
+    stop: float
+    target: float
 
 
 def load_env(path: Path = ENV_FILE) -> None:
@@ -265,6 +309,223 @@ def format_snapshot(snapshot: Snapshot, test_message: bool = False) -> str:
     )
 
 
+def entry_plan_from_snapshot(snapshot: Snapshot) -> EntryPlan:
+    if snapshot.decision not in {"LONG", "SHORT"}:
+        raise ValueError("Для плана входа нужен подтверждённый LONG или SHORT.")
+    assert snapshot.entry_low is not None
+    assert snapshot.entry_high is not None
+    assert snapshot.stop is not None
+    assert snapshot.target is not None
+    return EntryPlan(
+        ticker=snapshot.ticker,
+        direction=snapshot.decision,
+        signal_time=snapshot.time.isoformat(),
+        detected_at=datetime.now(timezone.utc).isoformat(),
+        entry_low=snapshot.entry_low,
+        entry_high=snapshot.entry_high,
+        stop=snapshot.stop,
+        target=snapshot.target,
+    )
+
+
+def entry_plan_status(
+    plan: EntryPlan,
+    price: float,
+    lifetime_minutes: int,
+    now: datetime | None = None,
+) -> str:
+    current_time = now or datetime.now(timezone.utc)
+    try:
+        detected_at = datetime.fromisoformat(plan.detected_at)
+    except ValueError:
+        return "EXPIRED"
+    if current_time - detected_at >= timedelta(minutes=lifetime_minutes):
+        return "EXPIRED"
+
+    if plan.direction == "LONG":
+        if price <= plan.stop:
+            return "CANCELLED"
+        if price >= plan.target:
+            return "MISSED"
+    else:
+        if price >= plan.stop:
+            return "CANCELLED"
+        if price <= plan.target:
+            return "MISSED"
+    if plan.entry_low <= price <= plan.entry_high:
+        return "READY"
+    return "WAITING"
+
+
+def format_entry_plan(plan: EntryPlan, price: float, status: str) -> str:
+    is_long = plan.direction == "LONG"
+    direction_name = "ЛОНГ" if is_long else "ШОРТ"
+    action_name = "ЛОНГ" if is_long else "ШОРТ"
+    if status == "READY":
+        heading = (
+            f"🟢 МОЖНО ОТКРЫТЬ {action_name} — {plan.ticker}"
+            if is_long
+            else f"🔴 МОЖНО ОТКРЫТЬ {action_name} — {plan.ticker}"
+        )
+        decision = f"ЦЕНА В ЗОНЕ — ОТКРЫТЬ {action_name}"
+        explanation = "Подтверждённый сценарий дождался нужной цены."
+    else:
+        heading = f"👀 {direction_name}-СЦЕНАРИЙ — {plan.ticker}"
+        decision = "ПОКА НЕ ВХОДИТЬ"
+        explanation = "Движение подтверждено, но цена ещё не находится в зоне входа."
+    return (
+        f"{heading}\n\n"
+        f"РЕШЕНИЕ: {decision}\n"
+        f"{explanation}\n\n"
+        f"Зона входа: {format_price(plan.entry_low)} — {format_price(plan.entry_high)}\n"
+        f"Цена сейчас: {format_price(price)}\n"
+        f"Защитный стоп: {format_price(plan.stop)}\n"
+        f"Цель: {format_price(plan.target)}\n\n"
+        "Если к моменту открытия цена уже вышла из зоны — пропустите вход. "
+        "Бот не выставляет заявку автоматически."
+    )
+
+
+def create_position_plan(position: OpenPosition, snapshot: Snapshot) -> PositionPlan:
+    entry = position.average_price if position.average_price > 0 else snapshot.price
+    risk = max(snapshot.atr * 0.75, abs(entry) * 0.001)
+    if position.direction == "LONG":
+        stop = entry - risk
+        target = entry + risk * 2
+    else:
+        stop = entry + risk
+        target = entry - risk * 2
+    return PositionPlan(
+        direction=position.direction,
+        entry=entry,
+        atr=max(snapshot.atr, risk),
+        stop=stop,
+        target=target,
+    )
+
+
+def assess_position(
+    position: OpenPosition,
+    snapshot: Snapshot,
+    plan: PositionPlan,
+) -> PositionAdvice:
+    is_long = position.direction == "LONG"
+    price = snapshot.price
+    hit_target = price >= plan.target if is_long else price <= plan.target
+    hit_stop = price <= plan.stop if is_long else price >= plan.stop
+    reversal = (
+        snapshot.ema_fast < snapshot.ema_slow and snapshot.rsi <= 45
+        if is_long
+        else snapshot.ema_fast > snapshot.ema_slow and snapshot.rsi >= 55
+    )
+
+    if hit_target:
+        return PositionAdvice("EXIT_TARGET", plan, "достигнута расчётная цель")
+    if hit_stop:
+        return PositionAdvice("EXIT_STOP", plan, "достигнут защитный стоп")
+    if reversal:
+        return PositionAdvice(
+            "EXIT_REVERSAL",
+            plan,
+            "EMA и RSI подтвердили разворот против позиции",
+        )
+
+    favorable_move = price - plan.entry if is_long else plan.entry - price
+    risk = abs(plan.entry - (plan.stop if plan.stage == "INITIAL" else plan.entry))
+    if risk <= 0:
+        risk = max(plan.atr * 0.75, abs(plan.entry) * 0.001)
+
+    if favorable_move >= risk * 1.5 and plan.stage != "TRAILING":
+        protected_profit = risk * 0.5
+        new_stop = (
+            plan.entry + protected_profit if is_long else plan.entry - protected_profit
+        )
+        updated = PositionPlan(
+            direction=plan.direction,
+            entry=plan.entry,
+            atr=plan.atr,
+            stop=new_stop,
+            target=plan.target,
+            stage="TRAILING",
+        )
+        return PositionAdvice(
+            "MOVE_STOP",
+            updated,
+            "цена прошла полторы величины первоначального риска",
+        )
+
+    if favorable_move >= risk and plan.stage == "INITIAL":
+        updated = PositionPlan(
+            direction=plan.direction,
+            entry=plan.entry,
+            atr=plan.atr,
+            stop=plan.entry,
+            target=plan.target,
+            stage="BREAKEVEN",
+        )
+        return PositionAdvice(
+            "MOVE_STOP",
+            updated,
+            "цена прошла одну величину первоначального риска",
+        )
+
+    return PositionAdvice("HOLD", plan, "условий для выхода пока нет")
+
+
+def format_position_advice(
+    position: OpenPosition,
+    snapshot: Snapshot,
+    advice: PositionAdvice,
+    event: str,
+) -> str:
+    direction_name = "ЛОНГ" if position.direction == "LONG" else "ШОРТ"
+    close_name = "лонг" if position.direction == "LONG" else "шорт"
+    direction_multiplier = 1 if position.direction == "LONG" else -1
+    move_pct = (
+        (snapshot.price / advice.plan.entry - 1) * 100 * direction_multiplier
+        if advice.plan.entry
+        else 0.0
+    )
+
+    if advice.action == "EXIT_TARGET":
+        heading = f"✅ ЦЕЛЬ ДОСТИГНУТА — {position.ticker}"
+        decision = f"ЗАКРЫТЬ {close_name.upper()} И ЗАФИКСИРОВАТЬ РЕЗУЛЬТАТ"
+    elif advice.action == "EXIT_STOP":
+        heading = f"🛑 СТОП ДОСТИГНУТ — {position.ticker}"
+        decision = f"ЗАКРЫТЬ {close_name.upper()}, НЕ ЖДАТЬ ОТСКОКА"
+    elif advice.action == "EXIT_REVERSAL":
+        heading = f"🔄 РАЗВОРОТ ПРОТИВ ПОЗИЦИИ — {position.ticker}"
+        decision = f"ЗАКРЫТЬ {close_name.upper()}"
+    elif advice.action == "MOVE_STOP":
+        heading = f"🟡 ЗАЩИТИТЬ ПОЗИЦИЮ — {position.ticker}"
+        decision = f"ПЕРЕНЕСТИ СТОП НА {format_price(advice.plan.stop)}"
+    elif event == "NEW":
+        heading = f"📌 ПОЗИЦИЯ НАЙДЕНА — {position.ticker}"
+        decision = (
+            f"ДЕРЖАТЬ; ЕСЛИ СТОП ЕЩЁ НЕ СТОИТ — ПОСТАВИТЬ НА "
+            f"{format_price(advice.plan.stop)}"
+        )
+    else:
+        heading = f"🟡 ПОЗИЦИЯ ПОД КОНТРОЛЕМ — {position.ticker}"
+        decision = "ДЕРЖАТЬ"
+
+    quantity = abs(position.quantity)
+    quantity_text = f"{quantity:.0f}" if quantity.is_integer() else f"{quantity:g}"
+    return (
+        f"{heading}\n\n"
+        f"Направление: {direction_name}\n"
+        f"Количество: {quantity_text}\n"
+        f"Средняя цена: {format_price(advice.plan.entry)}\n"
+        f"Сейчас: {format_price(snapshot.price)}\n"
+        f"Движение от входа: {move_pct:+.2f}%\n\n"
+        f"РЕШЕНИЕ: {decision}\n"
+        f"Причина: {advice.reason}.\n\n"
+        f"Защитный стоп: {format_price(advice.plan.stop)}\n"
+        f"Цель: {format_price(advice.plan.target)}\n\n"
+        "Бот не выставляет заявку: действие нужно выполнить в Т‑Инвестициях."
+    )
+
+
 def telegram_send(token: str, chat_id: str, text: str) -> None:
     payload = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -292,27 +553,206 @@ def save_state(state: dict[str, str]) -> None:
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def should_send(snapshot: Snapshot, state: dict[str, str], cooldown_minutes: int) -> bool:
-    if snapshot.decision == "WAIT":
-        return False
-    seen_key = f"last_seen:{snapshot.ticker}"
-    fingerprint = f"{snapshot.decision}:{snapshot.time.isoformat()}"
-    if state.get(seen_key) == fingerprint:
-        return False
-    state[seen_key] = fingerprint
+def fetch_open_positions(
+    client: object,
+    instruments: dict[str, str],
+) -> dict[str, list[OpenPosition]]:
+    ids_to_tickers = {instrument_id: ticker for ticker, instrument_id in instruments.items()}
+    watched_tickers = set(instruments)
+    accounts = list(client.users.get_accounts().accounts)
+    positions_by_ticker: dict[str, list[OpenPosition]] = {}
+    successful_accounts = 0
 
-    cooldown_key = f"last_sent:{snapshot.ticker}:{snapshot.decision}"
-    previous = state.get(cooldown_key)
-    now = datetime.now(timezone.utc)
-    if previous:
+    for account in accounts:
+        status = getattr(getattr(account, "status", None), "name", str(getattr(account, "status", "")))
+        if "CLOSED" in status:
+            continue
         try:
-            last_sent = datetime.fromisoformat(previous)
-            if now - last_sent < timedelta(minutes=cooldown_minutes):
-                return False
-        except ValueError:
+            portfolio = client.operations.get_portfolio(account_id=account.id)
+            successful_accounts += 1
+        except Exception:
+            logging.exception("Не удалось прочитать портфель одного из счетов")
+            continue
+
+        account_hash = hashlib.sha256(account.id.encode("utf-8")).hexdigest()[:12]
+        account_name = getattr(account, "name", "") or "Брокерский счёт"
+        for item in portfolio.positions:
+            item_uid = getattr(item, "instrument_uid", "")
+            item_figi = getattr(item, "figi", "")
+            item_ticker = str(getattr(item, "ticker", "")).upper()
+            ticker = (
+                ids_to_tickers.get(item_uid)
+                or ids_to_tickers.get(item_figi)
+                or (item_ticker if item_ticker in watched_tickers else None)
+            )
+            if not ticker:
+                continue
+            quantity = quotation_to_float(item.quantity)
+            if abs(quantity) < 0.000001:
+                continue
+            position = OpenPosition(
+                key=f"{account_hash}:{ticker}",
+                account_name=account_name,
+                ticker=ticker,
+                instrument_id=instruments[ticker],
+                quantity=quantity,
+                average_price=quotation_to_float(item.average_position_price),
+            )
+            positions_by_ticker.setdefault(ticker, []).append(position)
+
+    if accounts and successful_accounts == 0:
+        raise RuntimeError("Не удалось прочитать ни один доступный портфель T-Invest.")
+    return positions_by_ticker
+
+
+def load_position_plan(
+    state: dict[str, str],
+    position: OpenPosition,
+    snapshot: Snapshot,
+) -> tuple[PositionPlan, bool]:
+    state_key = f"position_plan:{position.key}"
+    raw_plan = state.get(state_key)
+    if raw_plan:
+        try:
+            plan = PositionPlan(**json.loads(raw_plan))
+            expected_entry = (
+                position.average_price if position.average_price > 0 else plan.entry
+            )
+            tolerance = max(snapshot.atr * 0.25, abs(plan.entry) * 0.001)
+            if (
+                plan.direction == position.direction
+                and abs(plan.entry - expected_entry) <= tolerance
+            ):
+                return plan, False
+        except (TypeError, ValueError, json.JSONDecodeError):
             pass
-    state[cooldown_key] = now.isoformat()
-    return True
+    return create_position_plan(position, snapshot), True
+
+
+def should_send_position_notice(
+    state: dict[str, str],
+    position: OpenPosition,
+    event: str,
+    hold_minutes: int,
+    exit_minutes: int,
+) -> bool:
+    raw_notice = state.get(f"position_notice:{position.key}")
+    if not raw_notice:
+        return True
+    try:
+        notice = json.loads(raw_notice)
+        previous_event = str(notice["event"])
+        previous_time = datetime.fromisoformat(str(notice["time"]))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return True
+
+    elapsed = datetime.now(timezone.utc) - previous_time
+    if event == "HOLD":
+        return elapsed >= timedelta(minutes=hold_minutes)
+    if event.startswith("MOVE_STOP"):
+        return previous_event != event
+    if previous_event != event:
+        return True
+    interval = exit_minutes if event.startswith("EXIT_") else hold_minutes
+    return elapsed >= timedelta(minutes=interval)
+
+
+def mark_position_notice(
+    state: dict[str, str],
+    position: OpenPosition,
+    event: str,
+) -> None:
+    state[f"position_notice:{position.key}"] = json.dumps(
+        {"event": event, "time": datetime.now(timezone.utc).isoformat()}
+    )
+
+
+def load_active_positions(state: dict[str, str]) -> dict[str, str]:
+    try:
+        value = json.loads(state.get("active_positions", "{}"))
+        return value if isinstance(value, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def clear_position_state(state: dict[str, str], position_key: str) -> None:
+    state.pop(f"position_plan:{position_key}", None)
+    state.pop(f"position_notice:{position_key}", None)
+
+
+def load_entry_plan(state: dict[str, str], ticker: str) -> EntryPlan | None:
+    raw_plan = state.get(f"entry_plan:{ticker}")
+    if not raw_plan:
+        return None
+    try:
+        return EntryPlan(**json.loads(raw_plan))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def store_entry_plan(state: dict[str, str], plan: EntryPlan) -> None:
+    state[f"entry_plan:{plan.ticker}"] = json.dumps(
+        asdict(plan), ensure_ascii=False
+    )
+
+
+def clear_entry_plan(state: dict[str, str], ticker: str) -> None:
+    state.pop(f"entry_plan:{ticker}", None)
+    state.pop(f"entry_notice:{ticker}", None)
+
+
+def update_entry_plan(
+    state: dict[str, str],
+    snapshot: Snapshot,
+) -> tuple[EntryPlan | None, bool]:
+    current = load_entry_plan(state, snapshot.ticker)
+    if snapshot.decision not in {"LONG", "SHORT"}:
+        return current, False
+    if (
+        current
+        and current.signal_time == snapshot.time.isoformat()
+        and current.direction == snapshot.decision
+    ):
+        return current, False
+    new_plan = entry_plan_from_snapshot(snapshot)
+    store_entry_plan(state, new_plan)
+    state.pop(f"entry_notice:{snapshot.ticker}", None)
+    return new_plan, True
+
+
+def should_send_entry_notice(
+    state: dict[str, str],
+    plan: EntryPlan,
+    event: str,
+    reminder_minutes: int,
+) -> bool:
+    raw_notice = state.get(f"entry_notice:{plan.ticker}")
+    if not raw_notice:
+        return True
+    try:
+        notice = json.loads(raw_notice)
+        previous_signal = str(notice["signal_time"])
+        previous_event = str(notice["event"])
+        previous_time = datetime.fromisoformat(str(notice["time"]))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return True
+    if previous_signal != plan.signal_time or previous_event != event:
+        return True
+    if event != "READY":
+        return False
+    return datetime.now(timezone.utc) - previous_time >= timedelta(
+        minutes=reminder_minutes
+    )
+
+
+def mark_entry_notice(state: dict[str, str], plan: EntryPlan, event: str) -> None:
+    state[f"entry_notice:{plan.ticker}"] = json.dumps(
+        {
+            "signal_time": plan.signal_time,
+            "event": event,
+            "time": datetime.now(timezone.utc).isoformat(),
+        }
+    )
 
 
 def resolve_instruments(client: object, tickers: Iterable[str]) -> dict[str, str]:
@@ -376,7 +816,10 @@ def run_cycle(
     telegram_token: str,
     chat_id: str,
     state: dict[str, str],
-    cooldown_minutes: int,
+    entry_plan_minutes: int,
+    entry_reminder_minutes: int,
+    position_hold_minutes: int,
+    exit_reminder_minutes: int,
     notify_always: bool,
 ) -> int:
     price_response = client.market_data.get_last_prices(
@@ -386,13 +829,85 @@ def run_cycle(
         item.instrument_uid: quotation_to_float(item.price)
         for item in price_response.last_prices
     }
+    positions_by_ticker = fetch_open_positions(client, instruments)
+    current_active = {
+        position.key: position.ticker
+        for positions in positions_by_ticker.values()
+        for position in positions
+    }
+    previous_active = load_active_positions(state)
+    active_for_state = dict(current_active)
     sent = 0
     for ticker, instrument_id in instruments.items():
         try:
             candles = fetch_candles(client, instrument_id)
             snapshot = analyze(ticker, candles, prices.get(instrument_id))
             logging.info("snapshot=%s", json.dumps(asdict(snapshot), default=str, ensure_ascii=False))
-            if notify_always or should_send(snapshot, state, cooldown_minutes):
+
+            open_positions = positions_by_ticker.get(ticker, [])
+            if open_positions:
+                clear_entry_plan(state, ticker)
+                for position in open_positions:
+                    plan, is_new = load_position_plan(state, position, snapshot)
+                    advice = assess_position(position, snapshot, plan)
+                    if advice.action.startswith("EXIT_"):
+                        event = advice.action
+                    elif advice.action == "MOVE_STOP":
+                        event = f"MOVE_STOP:{advice.plan.stage}"
+                    elif is_new:
+                        event = "NEW"
+                    else:
+                        event = "HOLD"
+
+                    if notify_always or should_send_position_notice(
+                        state,
+                        position,
+                        event,
+                        position_hold_minutes,
+                        exit_reminder_minutes,
+                    ):
+                        telegram_send(
+                            telegram_token,
+                            chat_id,
+                            format_position_advice(position, snapshot, advice, event),
+                        )
+                        mark_position_notice(state, position, event)
+                        state[f"position_plan:{position.key}"] = json.dumps(
+                            asdict(advice.plan), ensure_ascii=False
+                        )
+                        sent += 1
+                continue
+
+            entry_plan, _ = update_entry_plan(state, snapshot)
+            if entry_plan:
+                entry_status = entry_plan_status(
+                    entry_plan,
+                    snapshot.price,
+                    entry_plan_minutes,
+                )
+                if entry_status in {"EXPIRED", "CANCELLED", "MISSED"}:
+                    clear_entry_plan(state, ticker)
+                else:
+                    if notify_always or should_send_entry_notice(
+                        state,
+                        entry_plan,
+                        entry_status,
+                        entry_reminder_minutes,
+                    ):
+                        telegram_send(
+                            telegram_token,
+                            chat_id,
+                            format_entry_plan(
+                                entry_plan,
+                                snapshot.price,
+                                entry_status,
+                            ),
+                        )
+                        mark_entry_notice(state, entry_plan, entry_status)
+                        sent += 1
+                    continue
+
+            if notify_always:
                 telegram_send(
                     telegram_token,
                     chat_id,
@@ -401,6 +916,25 @@ def run_cycle(
                 sent += 1
         except Exception:
             logging.exception("Не удалось обработать %s", ticker)
+
+    for missing_key, missing_ticker in previous_active.items():
+        if missing_key in current_active:
+            continue
+        try:
+            telegram_send(
+                telegram_token,
+                chat_id,
+                f"✅ ПОЗИЦИЯ БОЛЬШЕ НЕ НАЙДЕНА — {missing_ticker}\n\n"
+                "Сопровождение этой позиции остановлено. Бот снова будет искать "
+                "новый вход по инструменту.",
+            )
+            clear_position_state(state, missing_key)
+            sent += 1
+        except Exception:
+            logging.exception("Не удалось сообщить о закрытии позиции %s", missing_ticker)
+            active_for_state[missing_key] = missing_ticker
+
+    state["active_positions"] = json.dumps(active_for_state, ensure_ascii=False)
     save_state(state)
     return sent
 
@@ -436,7 +970,10 @@ def main() -> int:
         if not tickers:
             raise RuntimeError("Список TICKERS пуст.")
         poll_seconds = parse_positive_int("POLL_SECONDS", 60, 30)
-        cooldown_minutes = parse_positive_int("COOLDOWN_MINUTES", 30, 1)
+        entry_plan_minutes = parse_positive_int("ENTRY_PLAN_MINUTES", 60, 5)
+        entry_reminder_minutes = parse_positive_int("ENTRY_REMINDER_MINUTES", 15, 5)
+        position_hold_minutes = parse_positive_int("POSITION_HOLD_MINUTES", 60, 5)
+        exit_reminder_minutes = parse_positive_int("EXIT_REMINDER_MINUTES", 15, 5)
     except (KeyError, RuntimeError) as error:
         print(f"Ошибка настроек: {error}")
         return 1
@@ -455,7 +992,10 @@ def main() -> int:
                     telegram_token,
                     chat_id,
                     state,
-                    cooldown_minutes,
+                    entry_plan_minutes,
+                    entry_reminder_minutes,
+                    position_hold_minutes,
+                    exit_reminder_minutes,
                     args.notify_always,
                 )
                 if args.once:

@@ -114,7 +114,10 @@ def main() -> int:
             f"TELEGRAM_CHAT_ID={chat_id}\n"
             "TICKERS=BRV6,CRU6,GDU6,IMOEXF,MXU6,NGU6,RIU6,SIU6,SVU6\n"
             "POLL_SECONDS=60\n"
-            "COOLDOWN_MINUTES=30\n"
+            "ENTRY_PLAN_MINUTES=60\n"
+            "ENTRY_REMINDER_MINUTES=15\n"
+            "POSITION_HOLD_MINUTES=60\n"
+            "EXIT_REMINDER_MINUTES=15\n"
             "SSL_TBANK_VERIFY=True\n"
         )
         ENV_FILE.write_text(content, encoding="utf-8")

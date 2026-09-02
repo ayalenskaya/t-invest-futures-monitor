@@ -1,9 +1,24 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
-from monitor import CandlePoint, analyze, atr, ema, format_snapshot, rsi
+from monitor import (
+    CandlePoint,
+    EntryPlan,
+    OpenPosition,
+    analyze,
+    assess_position,
+    atr,
+    create_position_plan,
+    ema,
+    entry_plan_status,
+    format_entry_plan,
+    format_position_advice,
+    format_snapshot,
+    rsi,
+)
 
 
 def series(*, breakout: str | None = None, volume: int = 100) -> list[CandlePoint]:
@@ -94,6 +109,118 @@ class IndicatorTests(unittest.TestCase):
         snapshot = analyze("TEST", series(), live_price=None)
         self.assertEqual(snapshot.alerts, ())
         self.assertEqual(snapshot.decision, "WAIT")
+
+
+class PositionManagementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.position = OpenPosition(
+            key="account:TEST",
+            account_name="Тестовый счёт",
+            ticker="TEST",
+            instrument_id="test-uid",
+            quantity=1.0,
+            average_price=100.0,
+        )
+        raw_snapshot = analyze("TEST", series(), live_price=100.1)
+        self.snapshot = replace(
+            raw_snapshot,
+            price=100.1,
+            atr=1.0,
+            rsi=55.0,
+            ema_fast=101.0,
+            ema_slow=100.0,
+        )
+
+    def test_new_long_position_gets_stop_and_target(self) -> None:
+        plan = create_position_plan(self.position, self.snapshot)
+        self.assertAlmostEqual(plan.stop, 99.25)
+        self.assertAlmostEqual(plan.target, 101.5)
+        self.assertEqual(assess_position(self.position, self.snapshot, plan).action, "HOLD")
+
+    def test_long_stop_and_target_generate_exit(self) -> None:
+        plan = create_position_plan(self.position, self.snapshot)
+        stopped = assess_position(
+            self.position, replace(self.snapshot, price=99.2), plan
+        )
+        targeted = assess_position(
+            self.position, replace(self.snapshot, price=101.6), plan
+        )
+        self.assertEqual(stopped.action, "EXIT_STOP")
+        self.assertEqual(targeted.action, "EXIT_TARGET")
+
+    def test_long_reversal_generates_exit(self) -> None:
+        plan = create_position_plan(self.position, self.snapshot)
+        reversed_market = replace(
+            self.snapshot,
+            price=100.2,
+            rsi=42.0,
+            ema_fast=99.0,
+            ema_slow=100.0,
+        )
+        advice = assess_position(self.position, reversed_market, plan)
+        self.assertEqual(advice.action, "EXIT_REVERSAL")
+
+    def test_profitable_move_tightens_stop(self) -> None:
+        plan = create_position_plan(self.position, self.snapshot)
+        advice = assess_position(
+            self.position, replace(self.snapshot, price=100.8), plan
+        )
+        self.assertEqual(advice.action, "MOVE_STOP")
+        self.assertEqual(advice.plan.stage, "BREAKEVEN")
+        self.assertAlmostEqual(advice.plan.stop, 100.0)
+
+    def test_short_position_uses_opposite_levels(self) -> None:
+        short = replace(self.position, quantity=-2.0)
+        short_snapshot = replace(
+            self.snapshot,
+            price=98.4,
+            rsi=45.0,
+            ema_fast=99.0,
+            ema_slow=100.0,
+        )
+        plan = create_position_plan(short, self.snapshot)
+        advice = assess_position(short, short_snapshot, plan)
+        self.assertEqual(advice.action, "EXIT_TARGET")
+
+    def test_position_message_contains_a_clear_decision(self) -> None:
+        plan = create_position_plan(self.position, self.snapshot)
+        advice = assess_position(self.position, self.snapshot, plan)
+        message = format_position_advice(
+            self.position, self.snapshot, advice, event="NEW"
+        )
+        self.assertIn("ПОЗИЦИЯ НАЙДЕНА", message)
+        self.assertIn("РЕШЕНИЕ: ДЕРЖАТЬ", message)
+
+
+class EntryManagementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+        self.now = now
+        self.plan = EntryPlan(
+            ticker="TEST",
+            direction="LONG",
+            signal_time=now.isoformat(),
+            detected_at=now.isoformat(),
+            entry_low=100.0,
+            entry_high=100.25,
+            stop=99.0,
+            target=102.0,
+        )
+
+    def test_entry_is_ready_only_inside_zone(self) -> None:
+        self.assertEqual(entry_plan_status(self.plan, 100.1, 60, self.now), "READY")
+        self.assertEqual(entry_plan_status(self.plan, 100.5, 60, self.now), "WAITING")
+
+    def test_entry_plan_expires_and_cancels(self) -> None:
+        later = self.now + timedelta(minutes=60)
+        self.assertEqual(entry_plan_status(self.plan, 100.1, 60, later), "EXPIRED")
+        self.assertEqual(entry_plan_status(self.plan, 98.9, 60, self.now), "CANCELLED")
+        self.assertEqual(entry_plan_status(self.plan, 102.1, 60, self.now), "MISSED")
+
+    def test_ready_message_says_when_to_open(self) -> None:
+        message = format_entry_plan(self.plan, 100.1, "READY")
+        self.assertIn("МОЖНО ОТКРЫТЬ ЛОНГ", message)
+        self.assertIn("ЦЕНА В ЗОНЕ", message)
 
 
 if __name__ == "__main__":

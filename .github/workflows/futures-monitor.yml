@@ -44,7 +44,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TICKERS: BRV6,CRU6,GDU6,IMOEXF,MXU6,NGU6,RIU6,SIU6,SVU6
-          COOLDOWN_MINUTES: "30"
+          ENTRY_PLAN_MINUTES: "60"
+          ENTRY_REMINDER_MINUTES: "15"
+          POSITION_HOLD_MINUTES: "60"
+          EXIT_REMINDER_MINUTES: "15"
           POLL_SECONDS: "60"
           SSL_TBANK_VERIFY: "True"
         run: python monitor.py --once
