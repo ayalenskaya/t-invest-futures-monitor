@@ -19,16 +19,16 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Download project
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
 
       - name: Restore signal memory
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: state.json
           key: monitor-state-${{ github.run_id }}
@@ -51,7 +51,7 @@ jobs:
 
       - name: Save signal memory
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: state.json
           key: monitor-state-${{ github.run_id }}
