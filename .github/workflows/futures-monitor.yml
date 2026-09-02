@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: futures-monitor
@@ -27,6 +27,14 @@ jobs:
           python-version: "3.13"
           cache: pip
 
+      - name: Restore signal memory
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: monitor-state-${{ github.run_id }}
+          restore-keys: |
+            monitor-state-
+
       - name: Install dependency
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
@@ -41,13 +49,9 @@ jobs:
           SSL_TBANK_VERIFY: "True"
         run: python monitor.py --once
 
-      - name: Remember sent signals
-        run: |
-          if git diff --quiet -- state.json; then
-            exit 0
-          fi
-          git config user.name "futures-monitor-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          git commit -m "Remember sent signal [skip ci]"
-          git push
+      - name: Save signal memory
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: monitor-state-${{ github.run_id }}
