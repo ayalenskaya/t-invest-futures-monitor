@@ -1,0 +1,53 @@
+name: Futures monitor
+
+on:
+  schedule:
+    # Every five minutes on trading weekdays. GitHub uses UTC.
+    - cron: "2-59/5 * * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: futures-monitor
+  cancel-in-progress: false
+
+jobs:
+  check-market:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependency
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Check futures and notify Telegram
+        env:
+          TINVEST_TOKEN: ${{ secrets.TINVEST_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TICKERS: BRV6,CRU6,GDU6,IMOEXF,MXU6,NGU6,RIU6,SIU6,SVU6
+          COOLDOWN_MINUTES: "30"
+          POLL_SECONDS: "60"
+          SSL_TBANK_VERIFY: "True"
+        run: python monitor.py --once
+
+      - name: Remember sent signals
+        run: |
+          if git diff --quiet -- state.json; then
+            exit 0
+          fi
+          git config user.name "futures-monitor-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "Remember sent signal [skip ci]"
+          git push
