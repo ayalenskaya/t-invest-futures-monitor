@@ -17,6 +17,7 @@ from monitor import (
     format_entry_plan,
     format_position_advice,
     format_snapshot,
+    parse_chat_ids,
     rsi,
 )
 
@@ -78,6 +79,13 @@ def confirmed_long_series() -> list[CandlePoint]:
 
 
 class IndicatorTests(unittest.TestCase):
+    def test_multiple_telegram_recipients_are_parsed(self) -> None:
+        self.assertEqual(parse_chat_ids("123, 456;123"), ["123", "456"])
+
+    def test_invalid_telegram_recipient_is_rejected(self) -> None:
+        with self.assertRaises(RuntimeError):
+            parse_chat_ids("@username")
+
     def test_ema_tracks_latest_values(self) -> None:
         self.assertGreater(ema([1, 2, 3, 4, 5], 3), 3)
 

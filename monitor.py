@@ -526,17 +526,42 @@ def format_position_advice(
     )
 
 
+def parse_chat_ids(value: str) -> list[str]:
+    chat_ids = list(
+        dict.fromkeys(
+            item.strip()
+            for item in value.replace(";", ",").split(",")
+            if item.strip()
+        )
+    )
+    if not chat_ids:
+        raise RuntimeError("Список получателей Telegram пуст.")
+    if any(not item.lstrip("-").isdigit() for item in chat_ids):
+        raise RuntimeError("Chat ID Telegram должны быть числами через запятую.")
+    return chat_ids
+
+
 def telegram_send(token: str, chat_id: str, text: str) -> None:
-    payload = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    request = urllib.request.Request(url, data=payload, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.URLError as error:
-        raise RuntimeError(f"Telegram недоступен: {error.reason}") from error
-    if not result.get("ok"):
-        raise RuntimeError(result.get("description", "Telegram не принял сообщение"))
+    errors: list[Exception] = []
+    for recipient in parse_chat_ids(chat_id):
+        payload = urllib.parse.urlencode(
+            {"chat_id": recipient, "text": text}
+        ).encode("utf-8")
+        request = urllib.request.Request(url, data=payload, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            if not result.get("ok"):
+                raise RuntimeError(
+                    result.get("description", "Telegram не принял сообщение")
+                )
+        except (urllib.error.URLError, RuntimeError) as error:
+            errors.append(error)
+    if errors:
+        raise RuntimeError(
+            f"Telegram не доставил сообщение получателям: {len(errors)}."
+        ) from errors[0]
 
 
 def load_state() -> dict[str, str]:
